@@ -1,0 +1,22 @@
+# Airbnb MCP Server Configuration
+# Wraps @openbnb/mcp-server-airbnb via the generic HTTP wrapper
+
+server:
+  # Display name for the server
+  name: "airbnb"
+
+  # Command to run the MCP server
+  command: "npx"
+
+  # Arguments to pass to the command
+  args:
+    - "-y"
+    - "@openbnb/mcp-server-airbnb"
+    - "--ignore-robots-txt"
+
+  # Environment variables for the MCP server
+  env:
+    NODE_ENV: "production"
+
+  # HTTP port to expose
+  port: 3041

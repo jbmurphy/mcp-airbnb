@@ -1,0 +1,93 @@
+# MCP Airbnb Deployment Manifests
+# Deploy with: kubectl apply -f k3s-deployment.yaml
+#
+# Prerequisites:
+# 1. Build and push image
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-airbnb
+  labels:
+    app: mcp-airbnb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-airbnb
+  template:
+    metadata:
+      labels:
+        app: mcp-airbnb
+    spec:
+      containers:
+      - name: mcp-airbnb
+        image: registry.local.jbmurphy.com/mcp-airbnb:latest
+        ports:
+        - containerPort: 3041
+          name: http
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3041"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3041
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3041
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-airbnb
+  labels:
+    app: mcp-airbnb
+spec:
+  type: ClusterIP
+  ports:
+  - port: 3041
+    targetPort: 3041
+    protocol: TCP
+    name: http
+  selector:
+    app: mcp-airbnb
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp-airbnb
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: mcp-airbnb.local.jbmurphy.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: mcp-airbnb
+            port:
+              number: 3041
