@@ -133,6 +133,7 @@ def extract_per_night_price(price_details: str) -> dict:
 def process_airbnb_search_results(data: dict) -> dict:
     """
     Post-process Airbnb search results to add clear per-night pricing and bedroom info.
+    Restructures output to prioritize per-night pricing and always include links.
     """
     if not isinstance(data, dict):
         return data
@@ -148,22 +149,25 @@ def process_airbnb_search_results(data: dict) -> dict:
         # Extract per-night price
         price_info = extract_per_night_price(price_details)
 
-        # Add pricePerNight to the listing at the top level for easy access
-        listing['pricePerNight'] = price_info['perNight']
-        listing['numberOfNights'] = price_info['nights']
-        listing['totalPrice'] = price_info['total']
-
-        # Also add a formatted string for convenience
-        if price_info['perNight']:
-            listing['pricePerNightFormatted'] = f"${price_info['perNight']:.2f}/night"
-        else:
-            listing['pricePerNightFormatted'] = None
-
         # Extract bedroom/bed info from primaryLine
         primary_line = listing.get('structuredContent', {}).get('primaryLine', '')
         bedroom_info = extract_bedroom_info(primary_line)
+
+        # Get name from nested structure
+        name = listing.get('demandStayListing', {}).get('description', {}).get('name', {}).get('localizedStringWithTranslationPreference', 'Unknown')
+
+        # Restructure listing with most important fields at the top level
+        # Per-night price is the primary price display
+        listing['name'] = name
+        listing['url'] = listing.get('url', '')
+        listing['pricePerNight'] = price_info['perNight']
+        listing['pricePerNightFormatted'] = f"${price_info['perNight']:.2f}/night" if price_info['perNight'] else None
+        listing['totalPrice'] = price_info['total']
+        listing['numberOfNights'] = price_info['nights']
         listing['bedrooms'] = bedroom_info['bedrooms']
         listing['beds'] = bedroom_info['beds']
+        listing['rating'] = listing.get('avgRatingA11yLabel', '')
+        listing['badges'] = listing.get('badges', '')
 
     return data
 
