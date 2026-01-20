@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Generic MCP HTTP Wrapper
-Wraps any stdio-based MCP server and exposes it via HTTP REST API
+Airbnb MCP HTTP Wrapper
+Wraps @openbnb/mcp-server-airbnb and adds per-night pricing extraction
 """
 import os
+import re
+import json
 import asyncio
 import threading
 import yaml
@@ -19,6 +21,168 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+
+def extract_bedroom_info(primary_line: str) -> dict:
+    """
+    Extract bedrooms and beds from primaryLine like '5 bedrooms, 8 beds' or '1 king bed'.
+
+    Examples:
+    - "5 bedrooms, 8 beds" -> {"bedrooms": 5, "beds": 8}
+    - "3 bedrooms, 3 queen beds" -> {"bedrooms": 3, "beds": 3}
+    - "1 king bed" -> {"bedrooms": None, "beds": 1}
+    - "Studio" -> {"bedrooms": 0, "beds": None}
+    """
+    result = {"bedrooms": None, "beds": None}
+
+    if not primary_line:
+        return result
+
+    # Check for studio (0 bedrooms)
+    if 'studio' in primary_line.lower():
+        result["bedrooms"] = 0
+
+    # Extract bedroom count - "N bedroom(s)"
+    bedroom_match = re.search(r'(\d+)\s*bedroom', primary_line, re.IGNORECASE)
+    if bedroom_match:
+        result["bedrooms"] = int(bedroom_match.group(1))
+
+    # Extract bed count - "N beds" or "N king/queen/double bed"
+    # Avoid matching "bedroom" by using negative lookahead
+    bed_match = re.search(r'(\d+)\s*(?:king\s*|queen\s*|double\s*)?beds?(?!room)', primary_line, re.IGNORECASE)
+    if bed_match:
+        result["beds"] = int(bed_match.group(1))
+
+    return result
+
+
+def filter_listings(data: dict, min_bedrooms: int = None, min_beds: int = None) -> dict:
+    """
+    Filter listings by bedroom/bed count.
+
+    Args:
+        data: The search results dict with 'searchResults' array
+        min_bedrooms: Minimum number of bedrooms required
+        min_beds: Minimum number of beds required
+
+    Returns:
+        Filtered data dict with only matching listings
+    """
+    if not min_bedrooms and not min_beds:
+        return data
+
+    if not isinstance(data, dict):
+        return data
+
+    search_results = data.get('searchResults', [])
+    original_count = len(search_results)
+
+    filtered = []
+    for listing in search_results:
+        bedrooms = listing.get('bedrooms')
+        beds = listing.get('beds')
+
+        # Apply bedroom filter
+        if min_bedrooms is not None:
+            if bedrooms is None or bedrooms < min_bedrooms:
+                continue
+
+        # Apply beds filter
+        if min_beds is not None:
+            if beds is None or beds < min_beds:
+                continue
+
+        filtered.append(listing)
+
+    data['searchResults'] = filtered
+    data['_filterApplied'] = {
+        'min_bedrooms': min_bedrooms,
+        'min_beds': min_beds,
+        'originalCount': original_count,
+        'filteredCount': len(filtered)
+    }
+
+    return data
+
+
+def extract_per_night_price(price_details: str) -> dict:
+    """
+    Extract per-night price from Airbnb priceDetails string.
+
+    Examples:
+    - "5 nights x $329.70: $1,648.50" -> {"perNight": 329.70, "nights": 5, "total": 1648.50}
+    - "5 nights x $184.00: $920.00" -> {"perNight": 184.00, "nights": 5, "total": 920.00}
+    """
+    result = {"perNight": None, "nights": None, "total": None, "currency": "$"}
+
+    if not price_details:
+        return result
+
+    # Pattern: "N nights x $X.XX: $Y.YY" or with commas like "$1,648.50"
+    pattern = r'(\d+)\s*nights?\s*x\s*\$?([\d,]+\.?\d*)\s*:\s*\$?([\d,]+\.?\d*)'
+    match = re.search(pattern, price_details, re.IGNORECASE)
+
+    if match:
+        result["nights"] = int(match.group(1))
+        result["perNight"] = float(match.group(2).replace(',', ''))
+        result["total"] = float(match.group(3).replace(',', ''))
+
+    return result
+
+
+def process_airbnb_search_results(data: dict) -> dict:
+    """
+    Post-process Airbnb search results to add clear per-night pricing and bedroom info.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    search_results = data.get('searchResults', [])
+
+    for listing in search_results:
+        # Get the price details string
+        display_price = listing.get('structuredDisplayPrice', {})
+        explanation_data = display_price.get('explanationData', {})
+        price_details = explanation_data.get('priceDetails', '')
+
+        # Extract per-night price
+        price_info = extract_per_night_price(price_details)
+
+        # Add pricePerNight to the listing at the top level for easy access
+        listing['pricePerNight'] = price_info['perNight']
+        listing['numberOfNights'] = price_info['nights']
+        listing['totalPrice'] = price_info['total']
+
+        # Also add a formatted string for convenience
+        if price_info['perNight']:
+            listing['pricePerNightFormatted'] = f"${price_info['perNight']:.2f}/night"
+        else:
+            listing['pricePerNightFormatted'] = None
+
+        # Extract bedroom/bed info from primaryLine
+        primary_line = listing.get('structuredContent', {}).get('primaryLine', '')
+        bedroom_info = extract_bedroom_info(primary_line)
+        listing['bedrooms'] = bedroom_info['bedrooms']
+        listing['beds'] = bedroom_info['beds']
+
+    return data
+
+
+def process_airbnb_response(tool_name: str, content_text: str) -> str:
+    """
+    Process Airbnb tool responses to enhance pricing information.
+    """
+    if tool_name != 'airbnb_search':
+        return content_text
+
+    try:
+        data = json.loads(content_text)
+        processed = process_airbnb_search_results(data)
+        return json.dumps(processed)
+    except (json.JSONDecodeError, TypeError):
+        return content_text
+
+
 CORS(app)
 
 # Create a persistent event loop in a background thread
@@ -173,6 +337,29 @@ def health():
         }
     }), 200
 
+def enhance_airbnb_search_schema(schema: dict) -> dict:
+    """
+    Add our custom filter parameters to the airbnb_search tool schema.
+    These are handled by our wrapper, not the upstream package.
+    """
+    if not schema or 'properties' not in schema:
+        return schema
+
+    # Add min_bedrooms parameter
+    schema['properties']['min_bedrooms'] = {
+        'type': 'number',
+        'description': 'Minimum number of bedrooms (filters results client-side)'
+    }
+
+    # Add min_beds parameter
+    schema['properties']['min_beds'] = {
+        'type': 'number',
+        'description': 'Minimum number of beds (filters results client-side)'
+    }
+
+    return schema
+
+
 @app.route('/mcp/list_tools', methods=['GET', 'POST'])
 def list_tools():
     """List all available tools"""
@@ -180,14 +367,26 @@ def list_tools():
         result = run_async(mcp_client.list_tools())
 
         # Convert MCP result to JSON-serializable format
-        tools_list = [
-            {
+        tools_list = []
+        for tool in result.tools:
+            tool_dict = {
                 "name": tool.name,
                 "description": tool.description or "",
                 "inputSchema": tool.inputSchema
             }
-            for tool in result.tools
-        ]
+
+            # Enhance airbnb_search with our custom filter parameters
+            if tool.name == 'airbnb_search':
+                tool_dict['inputSchema'] = enhance_airbnb_search_schema(
+                    tool_dict['inputSchema'].copy() if tool_dict['inputSchema'] else {}
+                )
+                # Update description to mention filtering
+                tool_dict['description'] = (
+                    tool_dict['description'] +
+                    ' Supports min_bedrooms and min_beds filters.'
+                )
+
+            tools_list.append(tool_dict)
 
         return jsonify({"tools": tools_list}), 200
 
@@ -201,21 +400,46 @@ def call_tool():
     try:
         data = request.json
         tool_name = data.get('name')
-        tool_args = data.get('arguments', {})
+        tool_args = data.get('arguments', {}).copy()  # Copy to avoid mutating original
 
         if not tool_name:
             return jsonify({"error": "Tool name is required"}), 400
 
+        # Extract our custom filter parameters (not supported by upstream)
+        min_bedrooms = tool_args.pop('min_bedrooms', None)
+        min_beds = tool_args.pop('min_beds', None)
+
+        # Convert to int if provided as string
+        if min_bedrooms is not None:
+            min_bedrooms = int(min_bedrooms)
+        if min_beds is not None:
+            min_beds = int(min_beds)
+
         result = run_async(mcp_client.call_tool(tool_name, tool_args))
 
-        # Convert MCP result to JSON-serializable format
-        content_list = [
-            {
+        # Convert MCP result to JSON-serializable format and apply post-processing
+        content_list = []
+        for content in result.content:
+            text = content.text if hasattr(content, 'text') else str(content)
+
+            # Post-process Airbnb search results to add per-night pricing and bedroom info
+            if tool_name == 'airbnb_search':
+                try:
+                    parsed_data = json.loads(text)
+                    # First enrich with pricing and bedroom data
+                    processed = process_airbnb_search_results(parsed_data)
+                    # Then apply filters
+                    filtered = filter_listings(processed, min_bedrooms=min_bedrooms, min_beds=min_beds)
+                    text = json.dumps(filtered)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            else:
+                text = process_airbnb_response(tool_name, text)
+
+            content_list.append({
                 "type": content.type,
-                "text": content.text if hasattr(content, 'text') else str(content)
-            }
-            for content in result.content
-        ]
+                "text": text
+            })
 
         return jsonify({"content": content_list}), 200
 
